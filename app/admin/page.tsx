@@ -1,151 +1,213 @@
 "use client";
-
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { db } from "@/lib/firebase/firebase";
-import { collection, addDoc } from "firebase/firestore";
-import Link from "next/link";
-import { useStore } from "@/store/store";
+import { collection, addDoc, getDocs, deleteDoc, doc, updateDoc, query, orderBy } from "firebase/firestore";
 
 export default function AdminDashboard() {
-  const [activeTab, setActiveTab] = useState<"chinese" | "math" | "story">("chinese");
-  const [inputValue, setInputValue] = useState("");
+  const [word, setWord] = useState("");
+  const [targetStudent, setTargetStudent] = useState("both"); // 預設共用
   const [loading, setLoading] = useState(false);
-  const [draftData, setDraftData] = useState<any>(null);
-  
-  const userRole = useStore((state) => state.userRole);
+  const [statusText, setStatusText] = useState("");
+  const [wordsList, setWordsList] = useState<any[]>([]);
+  const [actionId, setActionId] = useState<string | null>(null);
 
-  const handleGenerate = async () => {
-    if (!inputValue) return alert("請輸入生字或知識點");
-    setLoading(true);
-    setDraftData(null);
-
+  // 讀取現有生字
+  const fetchWords = async () => {
     try {
-      const endpoint = `/api/generate/${activeTab}`;
-      const payload = 
-        activeTab === "chinese" ? { word: inputValue } : 
-        activeTab === "math" ? { topic: inputValue } : 
-        { concept: inputValue };
-                   
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+      const q = query(collection(db, "Flashcards_Chinese"));
+      const snapshot = await getDocs(q);
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setWordsList(data);
+    } catch (error) {
+      console.error("讀取列表失敗:", error);
+    }
+  };
+
+  useEffect(() => {
+    fetchWords();
+  }, []);
+
+  // 核心生圖邏輯 (DeepSeek + SiliconFlow Flux)
+  const generateImageFlow = async (targetWord: string) => {
+    // 1. DeepSeek 文字轉指令
+    const deepseekRes = await fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.NEXT_PUBLIC_DEEPSEEK_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: [
+          {
+            role: "system",
+            content: `你是一位專為香港小學生設計視覺記憶卡的插畫指導。
+任務：根據提供的「中文生字」，構思 1 個搞笑、荒誕且能精準表達該字義的畫面，並翻譯為直接可用於 Flux 的英文生圖提示詞。
+絕對規則：嚴禁出現任何文字或符號。強制使用 "Flat vector illustration, vibrant colors, comic style, humorous, white background, no text" 作為後綴。必須是具體動作或物件。
+輸出格式：只輸出一段英文 prompt 字串，不要任何 JSON 標籤或多餘解釋。`
+          },
+          { role: "user", content: `生字：${targetWord}` }
+        ],
+        temperature: 0.7
+      })
+    });
+    if (!deepseekRes.ok) throw new Error("DeepSeek 請求失敗");
+    const deepseekData = await deepseekRes.json();
+    const imagePrompt = deepseekData.choices[0].message.content.trim();
+
+    // 2. SiliconFlow Flux 產生圖片
+    const siliconRes = await fetch("https://api.siliconflow.cn/v1/images/generations", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.NEXT_PUBLIC_SILICONFLOW_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "black-forest-labs/FLUX.1-schnell",
+        prompt: imagePrompt,
+        image_size: "1024x1024",
+        num_images: 1
+      })
+    });
+    if (!siliconRes.ok) throw new Error("SiliconFlow 請求失敗");
+    const siliconData = await siliconRes.json();
+    return siliconData.images[0].url;
+  };
+
+  // 新增生字
+  const handleAdd = async () => {
+    if (!word) return alert("請輸入生字");
+    setLoading(true);
+    setStatusText("正在生成圖片並儲存...");
+    try {
+      const imageUrl = await generateImageFlow(word);
+      await addDoc(collection(db, "Flashcards_Chinese"), {
+        word: word,
+        target_student: targetStudent,
+        explanation_yue: `(請手動填寫 ${word} 的廣東話解釋)`,
+        image_urls: [imageUrl],
+        status: "published",
+        createdAt: new Date().toISOString()
       });
-      
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      
-      setDraftData({ ...data, status: "draft" });
+      setWord("");
+      await fetchWords();
     } catch (error: any) {
-      alert("生成失敗: " + error.message);
+      alert(`新增失敗: ${error.message}`);
     } finally {
       setLoading(false);
+      setStatusText("");
     }
   };
 
-  const handleDraftChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+  // 刪除生字
+  const handleDelete = async (id: string) => {
+    if (!confirm("確定要刪除這個生字嗎？")) return;
     try {
-      setDraftData(JSON.parse(e.target.value));
-    } catch (err) {}
-  };
-
-  const handlePublish = async () => {
-    if (!draftData) return;
-    try {
-      const collectionName = 
-        activeTab === "chinese" ? "Flashcards_Chinese" :
-        activeTab === "math" ? "Questions_Math" :
-        "Stories_English_Finance";
-                             
-      const finalData = { ...draftData, status: "published", createdAt: new Date() };
-      
-      await addDoc(collection(db, collectionName), finalData);
-      
-      alert(`發佈成功！已寫入 Firestore [${collectionName}] 資料表。`);
-      setDraftData(null);
-      setInputValue("");
+      await deleteDoc(doc(db, "Flashcards_Chinese", id));
+      await fetchWords();
     } catch (error: any) {
-      alert("寫入失敗: " + error.message);
+      alert(`刪除失敗: ${error.message}`);
     }
   };
 
-  if (userRole === "brother" || userRole === "sister") {
-    return <div className="p-8 text-center text-red-600 font-bold text-2xl">禁止存取：學生帳號無法進入家長控制台</div>;
-  }
+  // 重新生成圖片
+  const handleRegenerateImage = async (id: string, targetWord: string) => {
+    if (!confirm(`確定要為「${targetWord}」重新生成圖片嗎？`)) return;
+    setActionId(id);
+    try {
+      const newImageUrl = await generateImageFlow(targetWord);
+      await updateDoc(doc(db, "Flashcards_Chinese", id), {
+        image_urls: [newImageUrl]
+      });
+      await fetchWords();
+      alert("圖片已重新生成！");
+    } catch (error: any) {
+      alert(`重抽失敗: ${error.message}`);
+    } finally {
+      setActionId(null);
+    }
+  };
 
   return (
-    <div className="min-h-screen p-8 bg-gray-50 text-gray-900">
-      <div className="max-w-4xl mx-auto mb-6 flex justify-between items-center">
-        <Link href="/" className="bg-gray-200 text-gray-800 px-4 py-2 rounded font-bold hover:bg-gray-300">
-          ⬅️ 返回首頁
-        </Link>
-        <span className="text-gray-500 font-bold">當前身分: 家長 (Admin)</span>
-      </div>
-
-      <div className="max-w-4xl mx-auto bg-white p-6 rounded-xl shadow">
-        <h1 className="text-2xl font-bold mb-6">家長控制台 (Admin Dashboard)</h1>
-        
-        <div className="flex gap-4 mb-6 border-b pb-4">
-          <button 
-            className={`px-4 py-2 rounded ${activeTab === "chinese" ? "bg-blue-600 text-white" : "bg-gray-200"}`}
-            onClick={() => { setActiveTab("chinese"); setDraftData(null); setInputValue(""); }}
-          >
-            中文生字卡
-          </button>
-          <button 
-            className={`px-4 py-2 rounded ${activeTab === "math" ? "bg-green-600 text-white" : "bg-gray-200"}`}
-            onClick={() => { setActiveTab("math"); setDraftData(null); setInputValue(""); }}
-          >
-            新加坡數學
-          </button>
-          <button 
-            className={`px-4 py-2 rounded ${activeTab === "story" ? "bg-purple-600 text-white" : "bg-gray-200"}`}
-            onClick={() => { setActiveTab("story"); setDraftData(null); setInputValue(""); }}
-          >
-            英文財商故事
-          </button>
-        </div>
-
-        <div className="mb-6 flex gap-4">
+    <div className="p-8 font-sans max-w-5xl mx-auto">
+      <h1 className="text-3xl font-bold mb-6">家長控制台 - 中文科管理</h1>
+      
+      {/* 新增區塊 */}
+      <div className="bg-slate-50 p-6 rounded-2xl shadow-sm border border-slate-200 mb-10">
+        <h2 className="text-xl font-bold mb-4">➕ 新增生字</h2>
+        <div className="flex gap-4 mb-4">
           <input 
             type="text" 
-            placeholder={
-              activeTab === "chinese" ? "請輸入繁體生字 (例: 努)" : 
-              activeTab === "math" ? "請輸入數學知識點 (例: Fractions adding)" : 
-              "請輸入財商/心理學概念 (例: Tulip Mania)"
-            }
-            className="border p-2 rounded flex-1"
-            value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
+            value={word} 
+            onChange={(e) => setWord(e.target.value)}
+            placeholder="輸入新生字..."
+            className="flex-1 p-4 text-xl rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
-          <button 
-            onClick={handleGenerate} 
-            disabled={loading}
-            className="bg-black text-white px-6 py-2 rounded disabled:bg-gray-400"
+          <select 
+            value={targetStudent}
+            onChange={(e) => setTargetStudent(e.target.value)}
+            className="p-4 text-lg rounded-xl border border-slate-300 bg-white"
           >
-            {loading ? "AI 生成中..." : "生成初稿"}
-          </button>
+            <option value="both">👦👧 共用</option>
+            <option value="brother">👦 哥哥專用</option>
+            <option value="sister">👧 妹妹專用</option>
+          </select>
         </div>
+        <button 
+          onClick={handleAdd}
+          disabled={loading}
+          className="w-full bg-blue-600 text-white font-bold py-4 rounded-xl hover:bg-blue-700 transition-colors disabled:bg-slate-400"
+        >
+          {loading ? statusText : "生成並發佈"}
+        </button>
+      </div>
 
-        {draftData && (
-          <div className="border rounded-xl p-4 bg-gray-50">
-            <h2 className="font-bold mb-2 text-red-600">⚠️ Draft 草稿預覽 (請核實無誤後發佈)</h2>
-            <p className="text-sm text-gray-500 mb-2">你可以在下方直接修改 JSON 內容來修正 AI 的錯誤。</p>
-            <textarea 
-              className="w-full h-64 p-4 font-mono text-sm border rounded bg-white mb-4"
-              defaultValue={JSON.stringify(draftData, null, 2)}
-              onChange={handleDraftChange}
-            />
-            <div className="flex justify-end">
-              <button 
-                onClick={handlePublish}
-                className="bg-blue-600 text-white px-8 py-3 rounded font-bold hover:bg-blue-700"
-              >
-                確認並發佈 (Publish)
-              </button>
-            </div>
-          </div>
-        )}
+      {/* 管理列表 */}
+      <h2 className="text-xl font-bold mb-4">📋 已建立生字列表</h2>
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+        <table className="w-full text-left border-collapse">
+          <thead>
+            <tr className="bg-slate-100 border-b border-slate-200">
+              <th className="p-4 font-bold text-slate-700">生字</th>
+              <th className="p-4 font-bold text-slate-700">目標</th>
+              <th className="p-4 font-bold text-slate-700">預覽圖片</th>
+              <th className="p-4 font-bold text-slate-700">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {wordsList.map((item) => (
+              <tr key={item.id} className="border-b border-slate-100 hover:bg-slate-50">
+                <td className="p-4 text-2xl font-bold">{item.word}</td>
+                <td className="p-4">
+                  {item.target_student === 'brother' ? '👦 哥哥' : item.target_student === 'sister' ? '👧 妹妹' : '👦👧 共用'}
+                </td>
+                <td className="p-4">
+                  {item.image_urls && item.image_urls[0] ? (
+                    <img src={item.image_urls[0]} alt={item.word} className="w-16 h-16 object-cover rounded-lg border border-slate-200" />
+                  ) : "無圖片"}
+                </td>
+                <td className="p-4 flex gap-2">
+                  <button 
+                    onClick={() => handleRegenerateImage(item.id, item.word)}
+                    disabled={actionId === item.id}
+                    className="bg-orange-100 text-orange-700 px-4 py-2 rounded-lg font-bold hover:bg-orange-200 disabled:opacity-50"
+                  >
+                    {actionId === item.id ? "🔄 生成中..." : "🔄 重抽圖片"}
+                  </button>
+                  <button 
+                    onClick={() => handleDelete(item.id)}
+                    className="bg-red-100 text-red-700 px-4 py-2 rounded-lg font-bold hover:bg-red-200"
+                  >
+                    🗑️ 刪除
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {wordsList.length === 0 && (
+              <tr><td colSpan={4} className="p-8 text-center text-slate-500">暫無數據</td></tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </div>
   );
